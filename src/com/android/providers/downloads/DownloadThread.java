@@ -18,9 +18,14 @@ package com.android.providers.downloads;
 
 import static com.android.providers.downloads.Constants.TAG;
 
+import android.app.DownloadManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.BroadcastReceiver;
+import android.content.res.Resources;
+import android.content.pm.PackageManager;
 import android.net.INetworkPolicyListener;
 import android.net.NetworkPolicyManager;
 import android.net.Proxy;
@@ -34,9 +39,11 @@ import android.provider.Downloads;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
+import android.util.Base64;
 
 import org.apache.http.Header;
 import org.apache.http.HttpResponse;
+import org.apache.http.HeaderElement;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.conn.params.ConnRouteParams;
 
@@ -47,7 +54,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.SyncFailedException;
 import java.net.URI;
+import java.net.URL;
 import java.net.URISyntaxException;
+import java.net.MalformedURLException;
+import java.util.NoSuchElementException;
 
 /**
  * Runs an actual download
@@ -59,6 +69,9 @@ public class DownloadThread extends Thread {
     private final SystemFacade mSystemFacade;
     private final StorageManager mStorageManager;
     private DrmConvertSession mDrmConvertSession;
+    private String mUser;
+    private String mPwd;
+    private int AUTH_WAIT_TIMEOUT = 2000;
 
     private volatile boolean mPolicyDirty;
 
@@ -69,6 +82,26 @@ public class DownloadThread extends Thread {
         mInfo = info;
         mStorageManager = storageManager;
     }
+
+    BroadcastReceiver mReceiver= new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent.getAction().equals(DownloadManager.AUTH_DOWNLOAD_RETURN_ACTION)) {
+                if(intent.hasExtra("username") && intent.hasExtra("password")){
+                    String username = intent.getStringExtra("username");
+                    String password = intent.getStringExtra("password");
+
+                    if(username != null && password != null){
+                        mUser = username;
+                        mPwd = password;
+                    }
+                }
+                synchronized (lock) {
+                    lock.notify();
+                }
+            }
+        }
+    };
 
     /**
      * Returns the user agent provided by the initiating app, or use the default one
@@ -703,6 +736,14 @@ public class DownloadThread extends Thread {
         }
     }
 
+    public static String getRealm(HttpResponse resp){
+        String value = resp.getLastHeader(org.apache.http.auth.AUTH.WWW_AUTH).getValue();
+        Header[]  headers = resp.getHeaders(org.apache.http.auth.AUTH.WWW_AUTH);
+        HeaderElement[] elements = headers[0].getElements();
+        String realm = elements[0].getValue();
+        return realm;
+    }
+
     /**
      * Check the HTTP response status and handle anything unusual (e.g. not 200/206).
      */
@@ -715,6 +756,11 @@ public class DownloadThread extends Thread {
         if (statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307) {
             handleRedirect(state, response, statusCode);
         }
+        if (statusCode == 401) {
+            mUser = null;
+            mPwd = null;
+            handleRequestAuth(state, response, statusCode);
+        }
 
         if (Constants.LOGV) {
             Log.i(Constants.TAG, "recevd_status = " + statusCode +
@@ -724,6 +770,50 @@ public class DownloadThread extends Thread {
         if (statusCode != expectedStatus) {
             handleOtherStatus(state, innerState, statusCode);
         }
+    }
+
+    Object lock = new Object();
+
+    private void handleRequestAuth(State state, HttpResponse response, int statusCode)
+            throws RetryDownload {
+        URL url = null;
+        try{
+            url = new URL(state.mRequestUri);
+        }catch(MalformedURLException e){
+            e.printStackTrace();
+            mUser = null;
+            mPwd = null;
+            return;
+        }
+        int port = url.getPort();
+        if(-1 == port)
+            port = url.getDefaultPort();
+        String host = url.getHost() + ":"+ port;
+        String realm = getRealm(response);
+
+        Intent i = new Intent();
+        i.setAction(DownloadManager.AUTH_DOWNLOAD_REQUEST_ACTION);
+        i.putExtra("host", host);
+        i.putExtra("realm", realm);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(DownloadManager.AUTH_DOWNLOAD_RETURN_ACTION);
+        mContext.registerReceiver(mReceiver, filter, DownloadManager.AUTH_DOWNLOAD_PERMISSION, null);
+
+        mContext.sendBroadcast(i, DownloadManager.AUTH_DOWNLOAD_PERMISSION);
+
+        synchronized (lock) {
+            try{
+                lock.wait(AUTH_WAIT_TIMEOUT);
+            } catch(IllegalMonitorStateException e) {
+                e.printStackTrace();
+            } catch(InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                mContext.unregisterReceiver(mReceiver);
+            }
+        }
+        if(mUser != null && mPwd != null)
+            throw new RetryDownload();
     }
 
     /**
@@ -943,6 +1033,12 @@ public class DownloadThread extends Thread {
      * Add custom headers for this download to the HTTP request.
      */
     private void addRequestHeaders(State state, HttpGet request) {
+        if(mUser != null && mPwd != null) {
+            String auth = mUser + ":" + mPwd;
+            String base64_str = Base64.encodeToString(auth.getBytes(), Base64.URL_SAFE|Base64.NO_WRAP);
+            request.addHeader("Authorization", "Basic "+ base64_str);
+        }
+
         for (Pair<String, String> header : mInfo.getHeaders()) {
             request.addHeader(header.first, header.second);
         }
