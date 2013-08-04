@@ -42,6 +42,8 @@
         android:description="@string/permdesc_accessAllDownloads"
         android:protectionLevel="signature"/>
 
+    <permission android:name="android.intent.action.AUTH_DOWNLOAD_PERMISSION" />
+    <uses-permission android:name="android.intent.action.AUTH_DOWNLOAD_PERMISSION" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_DOWNLOAD_MANAGER" />
     <uses-permission android:name="android.permission.ACCESS_CACHE_FILESYSTEM" />

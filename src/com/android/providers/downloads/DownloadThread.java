@@ -16,6 +16,7 @@
 
 package com.android.providers.downloads;
 
+
 import static android.provider.Downloads.Impl.STATUS_BAD_REQUEST;
 import static android.provider.Downloads.Impl.STATUS_CANNOT_RESUME;
 import static android.provider.Downloads.Impl.STATUS_FILE_ERROR;
@@ -29,9 +30,17 @@ import static java.net.HttpURLConnection.HTTP_INTERNAL_ERROR;
 import static java.net.HttpURLConnection.HTTP_MOVED_PERM;
 import static java.net.HttpURLConnection.HTTP_MOVED_TEMP;
 import static java.net.HttpURLConnection.HTTP_OK;
+import static java.net.HttpURLConnection.HTTP_UNAUTHORIZED;
 import static java.net.HttpURLConnection.HTTP_PARTIAL;
 import static java.net.HttpURLConnection.HTTP_SEE_OTHER;
 import static java.net.HttpURLConnection.HTTP_UNAVAILABLE;
+
+import android.app.DownloadManager;
+import android.content.IntentFilter;
+import android.content.BroadcastReceiver;
+import android.content.res.Resources;
+import android.content.pm.PackageManager;
+
 
 import android.content.ContentValues;
 import android.content.Context;
@@ -51,6 +60,7 @@ import android.provider.Downloads;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
+import android.util.Base64;
 
 import com.android.providers.downloads.DownloadInfo.NetworkState;
 
@@ -66,6 +76,10 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
 
+import org.apache.http.HeaderElement;
+import java.net.MalformedURLException;
+
+
 import libcore.io.IoUtils;
 
 /**
@@ -79,6 +93,10 @@ public class DownloadThread implements Runnable {
 
     private static final int HTTP_REQUESTED_RANGE_NOT_SATISFIABLE = 416;
     private static final int HTTP_TEMP_REDIRECT = 307;
+
+    private String mUser;
+    private String mPwd;
+    private int AUTH_WAIT_TIMEOUT = 2000;
 
     private static final int DEFAULT_TIMEOUT = (int) (20 * SECOND_IN_MILLIS);
 
@@ -98,6 +116,27 @@ public class DownloadThread implements Runnable {
         mStorageManager = storageManager;
         mNotifier = notifier;
     }
+
+    BroadcastReceiver mReceiver= new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent.getAction().equals(DownloadManager.AUTH_DOWNLOAD_RETURN_ACTION)) {
+                if(intent.hasExtra("username") && intent.hasExtra("password")){
+                    String username = intent.getStringExtra("username");
+                    String password = intent.getStringExtra("password");
+
+                    if(username != null && password != null){
+                        mUser = username;
+                        mPwd = password;
+                    }
+                }
+                synchronized (lock) {
+                    lock.notify();
+                }
+            }
+        }
+    };
+
 
     /**
      * Returns the user agent provided by the initiating app, or use the default one
@@ -157,6 +196,8 @@ public class DownloadThread implements Runnable {
             mRedirectionCount = 0;
         }
     }
+    private class RetryDownload extends Throwable {}
+
 
     @Override
     public void run() {
@@ -214,8 +255,18 @@ public class DownloadThread implements Runnable {
                 throw new StopRequestException(STATUS_BAD_REQUEST, e);
             }
 
-            executeDownload(state);
-
+            boolean finished = false;
+            while(!finished) {
+                try {
+                    executeDownload(state);
+                    finished = true;
+                } catch (RetryDownload exc) {
+                    // fall through
+                } finally {
+                    //request.abort();
+                    //request = null;
+                }
+            }
             finalizeDestinationFile(state);
             finalStatus = Downloads.Impl.STATUS_SUCCESS;
         } catch (StopRequestException error) {
@@ -254,7 +305,6 @@ public class DownloadThread implements Runnable {
                     }
                 }
             }
-
             // fall through to finally block
         } catch (Throwable ex) {
             errorMsg = ex.getMessage();
@@ -286,7 +336,7 @@ public class DownloadThread implements Runnable {
      * Fully execute a single download request. Setup and send the request,
      * handle the response, and transfer the data to the destination file.
      */
-    private void executeDownload(State state) throws StopRequestException {
+    private void executeDownload(State state) throws StopRequestException , RetryDownload{
         state.resetBeforeExecute();
         setupDestinationFile(state);
 
@@ -354,6 +404,15 @@ public class DownloadThread implements Runnable {
                         throw new StopRequestException(
                                 HTTP_INTERNAL_ERROR, conn.getResponseMessage());
 
+                    case HTTP_UNAUTHORIZED:
+                        mUser = null;
+                        mPwd = null;
+                        final String realm = conn.getHeaderField(org.apache.http.auth.AUTH.WWW_AUTH);
+         Log.v(Constants.TAG, "realm " + realm);
+
+                        handleRequestAuth(state, realm);
+                        break;
+
                     default:
                         StopRequestException.throwUnhandledHttpError(
                                 responseCode, conn.getResponseMessage());
@@ -368,6 +427,51 @@ public class DownloadThread implements Runnable {
         }
 
         throw new StopRequestException(STATUS_TOO_MANY_REDIRECTS, "Too many redirects");
+    }
+
+
+    Object lock = new Object();
+
+    private void handleRequestAuth(State state, String realm)
+            throws RetryDownload {
+        URL url = null;
+        try{
+            url = new URL(state.mRequestUri);
+        }catch(MalformedURLException e){
+            e.printStackTrace();
+            mUser = null;
+            mPwd = null;
+            return;
+        }
+        int port = url.getPort();
+        if(-1 == port)
+            port = url.getDefaultPort();
+        String host = url.getHost() + ":"+ port;
+        //String realm = getRealm(response);
+
+        Intent i = new Intent();
+        i.setAction(DownloadManager.AUTH_DOWNLOAD_REQUEST_ACTION);
+        i.putExtra("host", host);
+        i.putExtra("realm", realm);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(DownloadManager.AUTH_DOWNLOAD_RETURN_ACTION);
+        mContext.registerReceiver(mReceiver, filter, DownloadManager.AUTH_DOWNLOAD_PERMISSION, null);
+
+        mContext.sendBroadcast(i, DownloadManager.AUTH_DOWNLOAD_PERMISSION);
+
+        synchronized (lock) {
+            try{
+                lock.wait(AUTH_WAIT_TIMEOUT);
+            } catch(IllegalMonitorStateException e) {
+                e.printStackTrace();
+            } catch(InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                mContext.unregisterReceiver(mReceiver);
+            }
+        }
+        if(mUser != null && mPwd != null)
+            throw new RetryDownload();
     }
 
     /**
@@ -809,6 +913,13 @@ public class DownloadThread implements Runnable {
      * Add custom headers for this download to the HTTP request.
      */
     private void addRequestHeaders(State state, HttpURLConnection conn) {
+        if(mUser != null && mPwd != null) {
+            String auth = mUser + ":" + mPwd;
+            String base64_str = Base64.encodeToString(auth.getBytes(), Base64.URL_SAFE|Base64.NO_WRAP);
+            conn.addRequestProperty("Authorization", "Basic "+ base64_str);
+        }
+
+
         for (Pair<String, String> header : mInfo.getHeaders()) {
             conn.addRequestProperty(header.first, header.second);
         }
