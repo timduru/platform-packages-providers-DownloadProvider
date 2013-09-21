@@ -129,7 +129,9 @@ public class DownloadThread implements Runnable {
                         mUser = username;
                         mPwd = password;
                     }
+		    else Log.w(TAG, "AUTH_DOWNLOAD_RETURN_ACTION No username or password" );
                 }
+
                 synchronized (lock) {
                     lock.notify();
                 }
@@ -407,8 +409,13 @@ public class DownloadThread implements Runnable {
                     case HTTP_UNAUTHORIZED:
                         mUser = null;
                         mPwd = null;
-                        final String realm = conn.getHeaderField(org.apache.http.auth.AUTH.WWW_AUTH);
-         Log.v(Constants.TAG, "realm " + realm);
+
+                        final String realmHeader = conn.getHeaderField(org.apache.http.auth.AUTH.WWW_AUTH); // Basic realm="value" 
+                        String[] splitRealmHeader = null;
+                        if(realmHeader != null) splitRealmHeader = realmHeader.split("\"");
+                        String realm = null;
+                        if(splitRealmHeader != null && splitRealmHeader.length >=2) realm = splitRealmHeader[1]; // retrieve Basic realm value
+                        Log.v(Constants.TAG, "realm=" + realm);
 
                         handleRequestAuth(state, realm);
                         break;
